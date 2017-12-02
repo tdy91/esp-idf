@@ -9,6 +9,8 @@ System API
    Interrupt Allocation <intr_alloc>
    Watchdogs <wdts>
    Hooks <hooks>
+   Inter-Processor Call <ipc>
+   High Resolution Timer <esp_timer>
    Over The Air Updates (OTA) <ota>
    Sleep Modes <sleep_modes>
    Power Management <power_management>
