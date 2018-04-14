@@ -25,6 +25,8 @@
 #include "bta_api.h"
 #include "bta_sys.h"
 #include "bta_dm_int.h"
+#include "allocator.h"
+#include <string.h>
 
 
 /*****************************************************************************
@@ -35,6 +37,10 @@
 tBTA_DM_CB  bta_dm_cb;
 tBTA_DM_SEARCH_CB bta_dm_search_cb;
 tBTA_DM_DI_CB       bta_dm_di_cb;
+#else
+tBTA_DM_CB  *bta_dm_cb_ptr;
+tBTA_DM_SEARCH_CB *bta_dm_search_cb_ptr;
+tBTA_DM_DI_CB       *bta_dm_di_cb_ptr;
 #endif
 
 
@@ -105,6 +111,7 @@ const tBTA_DM_ACTION bta_dm_action[BTA_DM_MAX_EVT] = {
 #if BLE_PRIVACY_SPT == TRUE
     bta_dm_ble_config_local_privacy,        /* BTA_DM_API_LOCAL_PRIVACY_EVT */
 #endif
+    bta_dm_ble_config_local_icon,           /* BTA_DM_API_LOCAL_ICON_EVT */
     bta_dm_ble_set_adv_params,              /* BTA_DM_API_BLE_ADV_PARAM_EVT */
     bta_dm_ble_set_adv_params_all,          /* BTA_DM_API_BLE_ADV_PARAM_All_EVT */
     bta_dm_ble_set_adv_config,              /* BTA_DM_API_BLE_SET_ADV_CONFIG_EVT */
@@ -344,6 +351,18 @@ const tBTA_DM_ST_TBL bta_dm_search_st_tbl[] = {
 void bta_dm_sm_disable( )
 {
     bta_sys_deregister( BTA_ID_DM );
+}
+
+void bta_dm_sm_deinit(void)
+{
+    memset(&bta_dm_cb, 0, sizeof(tBTA_DM_CB));
+    memset(&bta_dm_search_cb, 0, sizeof(tBTA_DM_SEARCH_CB));
+    memset(&bta_dm_di_cb, 0, sizeof(tBTA_DM_DI_CB));
+#if BTA_DYNAMIC_MEMORY
+    FREE_AND_RESET(bta_dm_cb_ptr);
+    FREE_AND_RESET(bta_dm_search_cb_ptr);
+    FREE_AND_RESET(bta_dm_di_cb_ptr);
+#endif /* #if BTA_DYNAMIC_MEMORY */
 }
 
 

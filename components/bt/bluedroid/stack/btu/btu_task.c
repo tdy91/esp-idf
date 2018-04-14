@@ -86,11 +86,14 @@ extern void avdt_rcv_sync_info (BT_HDR *p_buf);
 //#endif
 
 extern void BTE_InitStack(void);
+extern void BTE_DeinitStack(void);
 
 /* Define BTU storage area
 */
 #if BTU_DYNAMIC_MEMORY == FALSE
 tBTU_CB  btu_cb;
+#else
+tBTU_CB  *btu_cb_ptr;
 #endif
 
 extern hash_map_t *btu_general_alarm_hash_map;
@@ -312,6 +315,7 @@ void btu_task_shut_down(void)
 #if (defined(BTA_INCLUDED) && BTA_INCLUDED == TRUE)
     bta_sys_free();
 #endif
+    BTE_DeinitStack();
 
     btu_free_core();
 }
@@ -498,6 +502,31 @@ void btu_stop_timer(TIMER_LIST_ENT *p_tle)
     osi_alarm_cancel(alarm);
 }
 
+/*******************************************************************************
+**
+** Function         btu_free_timer
+**
+** Description      Stop and free a timer.
+**
+** Returns          void
+**
+*******************************************************************************/
+void btu_free_timer(TIMER_LIST_ENT *p_tle)
+{
+    assert(p_tle != NULL);
+
+    p_tle->in_use = FALSE;
+
+    // Get the alarm for the timer list entry.
+    osi_alarm_t *alarm = hash_map_get(btu_general_alarm_hash_map, p_tle);
+    if (alarm == NULL) {
+        LOG_DEBUG("%s Unable to find expected alarm in hashmap", __func__);
+        return;
+    }
+    osi_alarm_cancel(alarm);
+    hash_map_erase(btu_general_alarm_hash_map, p_tle);
+}
+
 #if defined(QUICK_TIMER_TICKS_PER_SEC) && (QUICK_TIMER_TICKS_PER_SEC > 0)
 /*******************************************************************************
 **
@@ -585,6 +614,23 @@ void btu_stop_quick_timer(TIMER_LIST_ENT *p_tle)
     }
     osi_alarm_cancel(alarm);
 }
+
+void btu_free_quick_timer(TIMER_LIST_ENT *p_tle)
+{
+    assert(p_tle != NULL);
+
+    p_tle->in_use = FALSE;
+
+    // Get the alarm for the timer list entry.
+    osi_alarm_t *alarm = hash_map_get(btu_l2cap_alarm_hash_map, p_tle);
+    if (alarm == NULL) {
+        LOG_DEBUG("%s Unable to find expected alarm in hashmap", __func__);
+        return;
+    }
+    osi_alarm_cancel(alarm);
+    hash_map_erase(btu_l2cap_alarm_hash_map, p_tle);
+}
+
 #endif /* defined(QUICK_TIMER_TICKS_PER_SEC) && (QUICK_TIMER_TICKS_PER_SEC > 0) */
 
 void btu_oneshot_alarm_cb(void *data)

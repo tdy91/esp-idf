@@ -36,6 +36,7 @@
 
 #include "btu.h"
 #include "p_256_ecc_pp.h"
+#include "allocator.h"
 
 /*******************************************************************************
 **
@@ -48,6 +49,9 @@
 *******************************************************************************/
 void SMP_Init(void)
 {
+#if SMP_DYNAMIC_MEMORY
+    smp_cb_ptr = (tSMP_CB *)osi_malloc(sizeof(tSMP_CB));
+#endif
     memset(&smp_cb, 0, sizeof(tSMP_CB));
 
 #if defined(SMP_INITIAL_TRACE_LEVEL)
@@ -60,6 +64,14 @@ void SMP_Init(void)
     smp_l2cap_if_init();
     /* initialization of P-256 parameters */
     p_256_init_curve(KEY_LENGTH_DWORDS_P256);
+}
+
+void SMP_Free(void)
+{
+    memset(&smp_cb, 0, sizeof(tSMP_CB));
+#if SMP_DYNAMIC_MEMORY
+    FREE_AND_RESET(smp_cb_ptr);
+#endif /* #if SMP_DYNAMIC_MEMORY */
 }
 
 
@@ -143,7 +155,7 @@ tSMP_STATUS SMP_Pair (BD_ADDR bd_addr)
 
         memcpy (p_cb->pairing_bda, bd_addr, BD_ADDR_LEN);
 
-        if (!L2CA_ConnectFixedChnl (L2CAP_SMP_CID, bd_addr)) {
+        if (!L2CA_ConnectFixedChnl (L2CAP_SMP_CID, bd_addr, BLE_ADDR_UNKNOWN_TYPE)) {
             SMP_TRACE_ERROR("%s: L2C connect fixed channel failed.\n", __FUNCTION__);
             smp_sm_event(p_cb, SMP_AUTH_CMPL_EVT, &status);
             return status;
@@ -186,7 +198,7 @@ tSMP_STATUS SMP_BR_PairWith (BD_ADDR bd_addr)
 
     memcpy (p_cb->pairing_bda, bd_addr, BD_ADDR_LEN);
 
-    if (!L2CA_ConnectFixedChnl (L2CAP_SMP_BR_CID, bd_addr)) {
+    if (!L2CA_ConnectFixedChnl (L2CAP_SMP_BR_CID, bd_addr, BLE_ADDR_UNKNOWN_TYPE)) {
         SMP_TRACE_ERROR("%s: L2C connect fixed channel failed.", __FUNCTION__);
         smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &status);
         return status;

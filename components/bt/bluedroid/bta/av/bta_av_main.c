@@ -194,6 +194,8 @@ const tBTA_AV_NSM_ACT bta_av_nsm_act[] = {
 /* AV control block */
 #if BTA_DYNAMIC_MEMORY == FALSE
 tBTA_AV_CB  bta_av_cb;
+#else
+tBTA_AV_CB  *bta_av_cb_ptr;
 #endif
 
 #if (defined(BTA_AV_DEBUG) && BTA_AV_DEBUG == TRUE)
@@ -1237,9 +1239,10 @@ BOOLEAN bta_av_hdl_event(BT_HDR *p_msg)
         bta_av_sm_execute(&bta_av_cb, p_msg->event, (tBTA_AV_DATA *) p_msg);
     } else {
         APPL_TRACE_VERBOSE("handle=0x%x\n", p_msg->layer_specific);
+        tBTA_AV_SCB *p_scb = bta_av_hndl_to_scb(p_msg->layer_specific);
+        p_scb->disc_rsn = p_msg->offset;
         /* stream state machine events */
-        bta_av_ssm_execute( bta_av_hndl_to_scb(p_msg->layer_specific),
-                            p_msg->event, (tBTA_AV_DATA *) p_msg);
+        bta_av_ssm_execute(p_scb, p_msg->event, (tBTA_AV_DATA *) p_msg);
     }
     return TRUE;
 }

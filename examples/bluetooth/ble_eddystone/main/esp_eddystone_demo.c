@@ -1,16 +1,10 @@
-// Copyright 2015-2017 Espressif Systems (Shanghai) PTE LTD
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+/*
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
 
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
 
 
 /****************************************************************************
@@ -23,7 +17,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "bt.h"
+#include "esp_bt.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_bt_defs.h"
@@ -85,6 +79,8 @@ static void esp_eddystone_show_inform(const esp_eddystone_result_t* res)
 
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param)
 {
+    esp_err_t err;
+
     switch(event)
     {
         case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: {
@@ -93,8 +89,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* par
             break;
         }
         case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT: {
-            if(param->scan_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGE(DEMO_TAG,"Scan start failed");
+            if((err = param->scan_start_cmpl.status) != ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGE(DEMO_TAG,"Scan start failed: %s", esp_err_to_name(err));
             }
             else {
                 ESP_LOGI(DEMO_TAG,"Start scanning...");
@@ -130,8 +126,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* par
             break;
         }
         case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:{
-            if(param->scan_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGE(DEMO_TAG,"Scan stop failed");
+            if((err = param->scan_stop_cmpl.status) != ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGE(DEMO_TAG,"Scan stop failed: %s", esp_err_to_name(err));
             }
             else {
                 ESP_LOGI(DEMO_TAG,"Stop scan successfully");
@@ -151,7 +147,7 @@ void esp_eddystone_appRegister(void)
 
     /*<! register the scan callback function to the gap module */
     if((status = esp_ble_gap_register_callback(esp_gap_cb)) != ESP_OK) {
-        ESP_LOGE(DEMO_TAG,"gap register error,error code = %x",status);
+        ESP_LOGE(DEMO_TAG,"gap register error: %s", esp_err_to_name(status));
         return;
     }
 }
@@ -166,9 +162,10 @@ void esp_eddystone_init(void)
 void app_main()
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_bt_controller_init(&bt_cfg);
-    esp_bt_controller_enable(ESP_BT_MODE_BTDM);
+    esp_bt_controller_enable(ESP_BT_MODE_BLE);
  
     esp_eddystone_init();
 

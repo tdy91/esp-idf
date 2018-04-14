@@ -106,6 +106,12 @@ void btc_blufi_protocol_handler(uint8_t type, uint8_t *data, int len)
             msg.act = ESP_BLUFI_EVENT_RECV_SLAVE_DISCONNECT_BLE;
             btc_transfer_context(&msg, NULL, 0, NULL);
             break;
+        case BLUFI_TYPE_CTRL_SUBTYPE_GET_WIFI_LIST:
+            msg.sig = BTC_SIG_API_CB;
+            msg.pid = BTC_PID_BLUFI;
+            msg.act = ESP_BLUFI_EVENT_GET_WIFI_LIST;
+            btc_transfer_context(&msg, NULL, 0, NULL);
+            break;
         default:
             LOG_ERROR("%s Unkown Ctrl pkt %02x\n", __func__, type);
             break;
@@ -243,6 +249,14 @@ void btc_blufi_protocol_handler(uint8_t type, uint8_t *data, int len)
             param.client_pkey.pkey = &data[0];
             param.client_pkey.pkey_len = len;
 
+            btc_transfer_context(&msg, &param, sizeof(esp_blufi_cb_param_t), btc_blufi_cb_deep_copy);
+            break;
+        case BLUFI_TYPE_DATA_SUBTYPE_CUSTOM_DATA:
+            msg.sig = BTC_SIG_API_CB;
+            msg.pid = BTC_PID_BLUFI;
+            msg.act = ESP_BLUFI_EVENT_RECV_CUSTOM_DATA;
+            param.custom_data.data = &data[0];
+            param.custom_data.data_len = len;
             btc_transfer_context(&msg, &param, sizeof(esp_blufi_cb_param_t), btc_blufi_cb_deep_copy);
             break;
         default:

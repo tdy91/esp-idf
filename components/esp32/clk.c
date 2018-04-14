@@ -27,10 +27,10 @@
 #include "soc/soc.h"
 #include "soc/rtc.h"
 #include "soc/rtc_cntl_reg.h"
-#include "soc/dport_reg.h"
 #include "soc/i2s_reg.h"
 #include "driver/periph_ctrl.h"
 #include "xtensa/core-macros.h"
+#include "bootloader_clock.h"
 
 /* Number of cycles to wait from the 32k XTAL oscillator to consider it running.
  * Larger values increase startup delay. Smaller values may cause false positive
@@ -54,6 +54,22 @@ void esp_clk_init(void)
 {
     rtc_config_t cfg = RTC_CONFIG_DEFAULT();
     rtc_init(cfg);
+
+#ifdef CONFIG_COMPATIBLE_PRE_V2_1_BOOTLOADERS
+    /* Check the bootloader set the XTAL frequency.
+
+       Bootloaders pre-v2.1 don't do this.
+    */
+    rtc_xtal_freq_t xtal_freq = rtc_clk_xtal_freq_get();
+    if (xtal_freq == RTC_XTAL_FREQ_AUTO) {
+        ESP_EARLY_LOGW(TAG, "RTC domain not initialised by bootloader");
+        bootloader_clock_configure();
+    }
+#else
+    /* If this assertion fails, either upgrade the bootloader or enable CONFIG_COMPATIBLE_PRE_V2_1_BOOTLOADERS */
+    assert(rtc_clk_xtal_freq_get() != RTC_XTAL_FREQ_AUTO);
+#endif
+
     rtc_clk_fast_freq_set(RTC_FAST_FREQ_8M);
 
 #ifdef CONFIG_ESP32_RTC_CLOCK_SOURCE_EXTERNAL_CRYSTAL
@@ -111,42 +127,52 @@ void IRAM_ATTR ets_update_cpu_frequency(uint32_t ticks_per_us)
 
 static void select_rtc_slow_clk(rtc_slow_freq_t slow_clk)
 {
-    if (slow_clk == RTC_SLOW_FREQ_32K_XTAL) {
-        /* 32k XTAL oscillator needs to be enabled and running before it can
-         * be used. Hardware doesn't have a direct way of checking if the
-         * oscillator is running. Here we use rtc_clk_cal function to count
-         * the number of main XTAL cycles in the given number of 32k XTAL
-         * oscillator cycles. If the 32k XTAL has not started up, calibration
-         * will time out, returning 0.
-         */
-        rtc_clk_32k_enable(true);
-        uint32_t cal_val = 0;
-        uint32_t wait = 0;
-        // increment of 'wait' counter equivalent to 3 seconds
-        const uint32_t warning_timeout = 3 /* sec */ * 32768 /* Hz */ / (2 * XTAL_32K_DETECT_CYCLES);
-        ESP_EARLY_LOGD(TAG, "waiting for 32k oscillator to start up")
-        do {
-            ++wait;
-            cal_val = rtc_clk_cal(RTC_CAL_32K_XTAL, XTAL_32K_DETECT_CYCLES);
-            if (wait % warning_timeout == 0) {
-                ESP_EARLY_LOGW(TAG, "still waiting for 32k oscillator to start up");
-            }
-        } while (cal_val == 0);
-        ESP_EARLY_LOGD(TAG, "32k oscillator ready, wait=%d", wait);
-    }
-    rtc_clk_slow_freq_set(slow_clk);
-    uint32_t cal_val;
-    if (SLOW_CLK_CAL_CYCLES > 0) {
-        /* TODO: 32k XTAL oscillator has some frequency drift at startup.
-         * Improve calibration routine to wait until the frequency is stable.
-         */
-        cal_val = rtc_clk_cal(RTC_CAL_RTC_MUX, SLOW_CLK_CAL_CYCLES);
-    } else {
-        const uint64_t cal_dividend = (1ULL << RTC_CLK_CAL_FRACT) * 1000000ULL;
-        cal_val = (uint32_t) (cal_dividend / rtc_clk_slow_freq_get_hz());
-    }
+    uint32_t cal_val = 0;
+    do {
+        if (slow_clk == RTC_SLOW_FREQ_32K_XTAL) {
+            /* 32k XTAL oscillator needs to be enabled and running before it can
+             * be used. Hardware doesn't have a direct way of checking if the
+             * oscillator is running. Here we use rtc_clk_cal function to count
+             * the number of main XTAL cycles in the given number of 32k XTAL
+             * oscillator cycles. If the 32k XTAL has not started up, calibration
+             * will time out, returning 0.
+             */
+            uint32_t wait = 0;
+            // increment of 'wait' counter equivalent to 3 seconds
+            const uint32_t warning_timeout = 3 /* sec */ * 32768 /* Hz */ / (2 * XTAL_32K_DETECT_CYCLES);
+            ESP_EARLY_LOGD(TAG, "waiting for 32k oscillator to start up")
+            do {
+                ++wait;
+                rtc_clk_32k_enable(true);
+                cal_val = rtc_clk_cal(RTC_CAL_32K_XTAL, XTAL_32K_DETECT_CYCLES);
+                if (wait % warning_timeout == 0) {
+                    ESP_EARLY_LOGW(TAG, "still waiting for 32k oscillator to start up");
+                }
+                if(cal_val == 0){
+                    rtc_clk_32k_enable(false);
+                    rtc_clk_32k_bootstrap(CONFIG_ESP32_RTC_XTAL_BOOTSTRAP_CYCLES);
+                }
+            } while (cal_val == 0);
+        }
+        rtc_clk_slow_freq_set(slow_clk);
+
+        if (SLOW_CLK_CAL_CYCLES > 0) {
+            /* TODO: 32k XTAL oscillator has some frequency drift at startup.
+             * Improve calibration routine to wait until the frequency is stable.
+             */
+            cal_val = rtc_clk_cal(RTC_CAL_RTC_MUX, SLOW_CLK_CAL_CYCLES);
+        } else {
+            const uint64_t cal_dividend = (1ULL << RTC_CLK_CAL_FRACT) * 1000000ULL;
+            cal_val = (uint32_t) (cal_dividend / rtc_clk_slow_freq_get_hz());
+        }
+    } while (cal_val == 0);
     ESP_EARLY_LOGD(TAG, "RTC_SLOW_CLK calibration value: %d", cal_val);
     esp_clk_slowclk_cal_set(cal_val);
+}
+
+void rtc_clk_select_rtc_slow_clk()
+{
+    select_rtc_slow_clk(RTC_SLOW_FREQ_32K_XTAL);
 }
 
 /* This function is not exposed as an API at this point.
@@ -187,7 +213,7 @@ void esp_perip_clk_init(void)
         common_perip_clk = DPORT_WDG_CLK_EN |
                               DPORT_I2S0_CLK_EN |
 #if CONFIG_CONSOLE_UART_NUM != 0
-                              DPORT_UART0_CLK_EN |
+                              DPORT_UART_CLK_EN |
 #endif
 #if CONFIG_CONSOLE_UART_NUM != 1
                               DPORT_UART1_CLK_EN |
@@ -203,10 +229,7 @@ void esp_perip_clk_init(void)
                               DPORT_LEDC_CLK_EN |
                               DPORT_UHCI1_CLK_EN |
                               DPORT_TIMERGROUP1_CLK_EN |
-//80MHz SPIRAM uses SPI2 as well; it's initialized before this is called. Do not disable the clock for that if this is enabled.
-#if !CONFIG_SPIRAM_SPEED_80M
                               DPORT_SPI_CLK_EN_2 |
-#endif
                               DPORT_PWM0_CLK_EN |
                               DPORT_I2C_EXT1_CLK_EN |
                               DPORT_CAN_CLK_EN |
@@ -227,6 +250,15 @@ void esp_perip_clk_init(void)
                               DPORT_WIFI_CLK_SDIO_HOST_EN |
                               DPORT_WIFI_CLK_EMAC_EN;
     }
+
+
+#if CONFIG_SPIRAM_SPEED_80M
+//80MHz SPIRAM uses SPI2 as well; it's initialized before this is called. Because it is used in
+//a weird mode where clock to the peripheral is disabled but reset is also disabled, it 'hangs'
+//in a state where it outputs a continuous 80MHz signal. Mask its bit here because we should
+//not modify that state, regardless of what we calculated earlier.
+    common_perip_clk &= ~DPORT_SPI_CLK_EN_2;
+#endif
 
     /* Change I2S clock to audio PLL first. Because if I2S uses 160MHz clock,
      * the current is not reduced when disable I2S clock.

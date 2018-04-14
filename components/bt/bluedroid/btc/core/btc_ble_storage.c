@@ -23,8 +23,13 @@
 
 #if (SMP_INCLUDED == TRUE)
 
+//the maximum nubmer of bonded devices
+#define BONED_DEVICES_MAX_COUNT (BTM_SEC_MAX_DEVICE_RECORDS)
+
 static void _btc_storage_save(void)
 {
+    uint16_t addr_section_count = 0;
+    const btc_config_section_iter_t *need_remove_iter = NULL;
     const btc_config_section_iter_t *iter = btc_config_section_begin();
 
     while (iter != btc_config_section_end()) {
@@ -48,10 +53,25 @@ static void _btc_storage_save(void)
             btc_config_remove_section(section);
             continue;
         }
-
+        if(addr_section_count == BONED_DEVICES_MAX_COUNT) {
+            need_remove_iter = iter;
+        }
+        addr_section_count ++;
         iter = btc_config_section_next(iter);
     }
-
+    /*exceeded the maximum nubmer of bonded devices, delete them */
+    if (need_remove_iter) {
+        while(need_remove_iter != btc_config_section_end()) {
+            const char *need_remove_section = btc_config_section_name(need_remove_iter);
+            if (!string_is_bdaddr(need_remove_section)) {
+                need_remove_iter = btc_config_section_next(need_remove_iter);
+                continue;
+            }
+            need_remove_iter = btc_config_section_next(need_remove_iter);
+            BTIF_TRACE_WARNING("exceeded the maximum nubmer of bonded devices, delete the last device info : %s", need_remove_section);
+            btc_config_remove_section(need_remove_section);
+        }
+    }
     btc_config_flush();
 }
 
@@ -372,7 +392,7 @@ bool _btc_storage_compare_address_key_value(bt_bdaddr_t *remote_bd_addr,
 {
     bdstr_t bdstr;
     bdaddr_to_string(remote_bd_addr, bdstr, sizeof(bdstr));
-    char *key_type_str;
+    const char *key_type_str;
     switch (key_type) {
     case BTM_LE_KEY_PENC:
         key_type_str = BTC_BLE_STORAGE_LE_KEY_PENC_STR;
@@ -764,7 +784,10 @@ bt_status_t btc_storage_get_bonded_ble_devices_list(esp_ble_bond_dev_t *bond_dev
         //resolve the peer device irk
         if (_btc_storage_get_ble_bonding_key(&bd_addr, BTM_LE_KEY_PID, buffer, sizeof(tBTM_LE_PID_KEYS)) == BT_STATUS_SUCCESS) {
             bond_dev->bond_key.key_mask |= ESP_BLE_ID_KEY_MASK;
-            memcpy(&bond_dev->bond_key.pid_key, buffer, sizeof(tBTM_LE_PID_KEYS));
+            tBTM_LE_PID_KEYS *pid_key = (tBTM_LE_PID_KEYS *) buffer;
+            memcpy(&bond_dev->bond_key.pid_key.irk, pid_key->irk, BT_OCTET16_LEN);
+            bond_dev->bond_key.pid_key.addr_type = pid_key->addr_type;
+            memcpy(&bond_dev->bond_key.pid_key.static_addr, pid_key->static_addr, sizeof(BD_ADDR));
         }
         //serch for the next bond device
         bond_dev++;

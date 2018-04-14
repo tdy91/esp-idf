@@ -34,6 +34,7 @@
 #include "sys/lock.h"
 #include "driver/rtc_cntl.h"
 #include "driver/gpio.h"
+#include "adc1_i2s_private.h"
 
 #ifndef NDEBUG
 // Enable built-in checks in queue.h in debug builds
@@ -99,6 +100,9 @@ static _lock_t adc2_wifi_lock = NULL;
 //prevent ADC2 being used by tasks (regardless of WIFI)
 portMUX_TYPE adc2_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
+//prevent ADC1 being used by I2S dma and other tasks at the same time.
+static _lock_t adc1_i2s_lock = NULL;
+
 typedef struct {
     TimerHandle_t timer;
     uint32_t filtered_val[TOUCH_PAD_MAX];
@@ -107,12 +111,6 @@ typedef struct {
     bool enable;
 } touch_pad_filter_t;
 static touch_pad_filter_t *s_touch_pad_filter = NULL;
-
-typedef enum {
-    ADC_FORCE_FSM = 0x0,
-    ADC_FORCE_DISABLE = 0x2,
-    ADC_FORCE_ENABLE = 0x3,
-} adc_force_mode_t;
 
 //Reg,Mux,Fun,IE,Up,Down,Rtc_number
 const rtc_gpio_desc_t rtc_gpio_desc[GPIO_PIN_COUNT] = {
@@ -157,6 +155,19 @@ const rtc_gpio_desc_t rtc_gpio_desc[GPIO_PIN_COUNT] = {
     {RTC_IO_SENSOR_PADS_REG, RTC_IO_SENSE3_MUX_SEL_M, RTC_IO_SENSE3_FUN_SEL_S, RTC_IO_SENSE3_FUN_IE_M, 0, 0, RTC_IO_SENSE3_SLP_SEL_M, RTC_IO_SENSE3_SLP_IE_M, RTC_IO_SENSE1_HOLD_M, RTC_CNTL_SENSE3_HOLD_FORCE_M, 0, 0, RTCIO_GPIO38_CHANNEL},                                                       //38
     {RTC_IO_SENSOR_PADS_REG, RTC_IO_SENSE4_MUX_SEL_M, RTC_IO_SENSE4_FUN_SEL_S, RTC_IO_SENSE4_FUN_IE_M, 0, 0, RTC_IO_SENSE4_SLP_SEL_M, RTC_IO_SENSE4_SLP_IE_M, RTC_IO_SENSE1_HOLD_M, RTC_CNTL_SENSE4_HOLD_FORCE_M, 0, 0, RTCIO_GPIO39_CHANNEL},                                                      //39
 };
+
+typedef enum {
+    ADC_CTRL_RTC = 0,
+    ADC_CTRL_ULP = 1,
+    ADC_CTRL_DIG = 2,
+    ADC2_CTRL_PWDET = 3,
+} adc_controller_t ;
+
+static const char TAG[] = "adc";
+
+static inline void dac_output_set_enable(dac_channel_t channel, bool enable);
+static inline void adc1_hall_enable(bool enable);
+
 
 /*---------------------------------------------------------------
                         RTC IO
@@ -383,6 +394,19 @@ esp_err_t rtc_gpio_hold_dis(gpio_num_t gpio_num)
     return ESP_OK;
 }
 
+esp_err_t rtc_gpio_isolate(gpio_num_t gpio_num)
+{
+    if (rtc_gpio_desc[gpio_num].reg == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    rtc_gpio_pullup_dis(gpio_num);
+    rtc_gpio_pulldown_dis(gpio_num);
+    rtc_gpio_set_direction(gpio_num, RTC_GPIO_MODE_DISABLED);
+    rtc_gpio_hold_en(gpio_num);
+
+    return ESP_OK;
+}
 
 void rtc_gpio_force_hold_dis_all()
 {
@@ -1025,10 +1049,28 @@ static esp_err_t adc_set_atten(adc_unit_t adc_unit, adc_channel_t channel, adc_a
     return ESP_OK;
 }
 
+void adc_power_always_on()
+{
+    portENTER_CRITICAL(&rtc_spinlock);
+    SENS.sar_meas_wait2.force_xpd_sar = SENS_FORCE_XPD_SAR_PU;
+    portEXIT_CRITICAL(&rtc_spinlock);
+}
+
 void adc_power_on()
 {
     portENTER_CRITICAL(&rtc_spinlock);
-    SENS.sar_meas_wait2.force_xpd_sar = ADC_FORCE_FSM;
+    //The power FSM controlled mode saves more power, while the ADC noise may get increased.
+#ifndef CONFIG_ADC_FORCE_XPD_FSM
+    //Set the power always on to increase precision.
+    SENS.sar_meas_wait2.force_xpd_sar = SENS_FORCE_XPD_SAR_PU;
+#else    
+    //Use the FSM to turn off the power while not used to save power.
+    if (SENS.sar_meas_wait2.force_xpd_sar & SENS_FORCE_XPD_SAR_SW_M) {
+        SENS.sar_meas_wait2.force_xpd_sar = SENS_FORCE_XPD_SAR_PU;
+    } else {
+        SENS.sar_meas_wait2.force_xpd_sar = SENS_FORCE_XPD_SAR_FSM;
+    }
+#endif
     portEXIT_CRITICAL(&rtc_spinlock);
 }
 
@@ -1037,7 +1079,7 @@ void adc_power_off()
     portENTER_CRITICAL(&rtc_spinlock);
     //Bit1  0:Fsm  1: SW mode
     //Bit0  0:SW mode power down  1: SW mode power on
-    SENS.sar_meas_wait2.force_xpd_sar = ADC_FORCE_DISABLE;
+    SENS.sar_meas_wait2.force_xpd_sar = SENS_FORCE_XPD_SAR_PD;
     portEXIT_CRITICAL(&rtc_spinlock);
 }
 
@@ -1107,6 +1149,102 @@ esp_err_t adc_set_data_width(adc_unit_t adc_unit, adc_bits_width_t bits)
     return ESP_OK;
 }
 
+// this function should be called in the critical section
+static void adc_set_controller(adc_unit_t unit, adc_controller_t ctrl )
+{
+    if ( unit == ADC_UNIT_1 ) {
+        switch( ctrl ) {
+            case ADC_CTRL_RTC:
+                SENS.sar_read_ctrl.sar1_dig_force = false;      //RTC controller controls the ADC, not digital controller
+                SENS.sar_meas_start1.meas1_start_force = true;  //RTC controller controls the ADC,not ulp coprocessor
+                SENS.sar_meas_start1.sar1_en_pad_force = true;  //RTC controller controls the data port, not ulp coprocessor
+                SENS.sar_touch_ctrl1.xpd_hall_force = true;     // RTC controller controls the hall sensor power,not ulp coprocessor
+                SENS.sar_touch_ctrl1.hall_phase_force = true;   // RTC controller controls the hall sensor phase,not ulp coprocessor
+                break;
+            case ADC_CTRL_ULP:
+                SENS.sar_read_ctrl.sar1_dig_force = false;
+                SENS.sar_meas_start1.meas1_start_force = false;
+                SENS.sar_meas_start1.sar1_en_pad_force = false;
+                SENS.sar_touch_ctrl1.xpd_hall_force = false;
+                SENS.sar_touch_ctrl1.hall_phase_force = false;
+                break;
+            case ADC_CTRL_DIG:
+                SENS.sar_read_ctrl.sar1_dig_force = true;
+                SENS.sar_meas_start1.meas1_start_force = true;
+                SENS.sar_meas_start1.sar1_en_pad_force = true;
+                SENS.sar_touch_ctrl1.xpd_hall_force = true;
+                SENS.sar_touch_ctrl1.hall_phase_force = true;
+                break;
+            default:
+                ESP_LOGE(TAG, "adc1 selects invalid controller");
+                break;            
+        }
+    } else if ( unit == ADC_UNIT_2) {
+        switch( ctrl ) {
+            case ADC_CTRL_RTC:
+                SENS.sar_meas_start2.meas2_start_force = true;  //RTC controller controls the ADC,not ulp coprocessor 
+                SENS.sar_meas_start2.sar2_en_pad_force = true;  //RTC controller controls the data port, not ulp coprocessor
+                SENS.sar_read_ctrl2.sar2_dig_force = false;     //RTC controller controls the ADC, not digital controller
+                SENS.sar_read_ctrl2.sar2_pwdet_force = false;   //RTC controller controls the ADC, not PWDET
+                SYSCON.saradc_ctrl.sar2_mux = true;             //RTC controller controls the ADC, not PWDET
+                break;
+            case ADC_CTRL_ULP:
+                SENS.sar_meas_start2.meas2_start_force = false;
+                SENS.sar_meas_start2.sar2_en_pad_force = false;
+                SENS.sar_read_ctrl2.sar2_dig_force = false;
+                SENS.sar_read_ctrl2.sar2_pwdet_force = false;
+                SYSCON.saradc_ctrl.sar2_mux = true;
+                break;
+            case ADC_CTRL_DIG:
+                SENS.sar_meas_start2.meas2_start_force = true;
+                SENS.sar_meas_start2.sar2_en_pad_force = true;
+                SENS.sar_read_ctrl2.sar2_dig_force = true;
+                SENS.sar_read_ctrl2.sar2_pwdet_force = false;
+                SYSCON.saradc_ctrl.sar2_mux = true;
+                break;
+            case ADC2_CTRL_PWDET:
+                //currently only used by Wi-Fi
+                SENS.sar_meas_start2.meas2_start_force = true;
+                SENS.sar_meas_start2.sar2_en_pad_force = true;
+                SENS.sar_read_ctrl2.sar2_dig_force = false;
+                SENS.sar_read_ctrl2.sar2_pwdet_force = true;
+                SYSCON.saradc_ctrl.sar2_mux = false;
+                break;
+            default:
+                ESP_LOGE(TAG, "adc2 selects invalid controller");
+                break;            
+        }
+    } else {
+      ESP_LOGE(TAG, "invalid adc unit");
+      assert(0);
+    }
+}
+
+// this function should be called in the critical section
+static int adc_convert( adc_unit_t unit, int channel)
+{
+    uint16_t adc_value;
+    if ( unit == ADC_UNIT_1 ) {
+        SENS.sar_meas_start1.sar1_en_pad = (1 << channel); //only one channel is selected.
+        while (SENS.sar_slave_addr1.meas_status != 0);
+        SENS.sar_meas_start1.meas1_start_sar = 0;
+        SENS.sar_meas_start1.meas1_start_sar = 1;
+        while (SENS.sar_meas_start1.meas1_done_sar == 0);
+        adc_value = SENS.sar_meas_start1.meas1_data_sar;
+    } else if ( unit == ADC_UNIT_2 ) {
+        SENS.sar_meas_start2.sar2_en_pad = (1 << channel); //only one channel is selected.    
+        
+        SENS.sar_meas_start2.meas2_start_sar = 0; //start force 0
+        SENS.sar_meas_start2.meas2_start_sar = 1; //start force 1
+        while (SENS.sar_meas_start2.meas2_done_sar == 0) {}; //read done
+        adc_value = SENS.sar_meas_start2.meas2_data_sar;    
+    } else {
+        ESP_LOGE(TAG, "invalid adc unit");
+        assert(0);
+    }
+    return adc_value;
+}
+
 /*-------------------------------------------------------------------------------------
  *                      ADC I2S
  *------------------------------------------------------------------------------------*/
@@ -1161,20 +1299,16 @@ esp_err_t adc_i2s_mode_init(adc_unit_t adc_unit, adc_channel_t channel)
 
     uint8_t table_len = 1;
     //POWER ON SAR
-    adc_power_on();
+    adc_power_always_on();
     adc_gpio_init(adc_unit, channel);
     adc_set_i2s_data_len(adc_unit, table_len);
     adc_set_i2s_data_pattern(adc_unit, 0, channel, ADC_WIDTH_BIT_12, ADC_ATTEN_DB_11);
     portENTER_CRITICAL(&rtc_spinlock);
     if (adc_unit & ADC_UNIT_1) {
-        //switch SARADC into DIG channel
-        SENS.sar_read_ctrl.sar1_dig_force = 1;
+        adc_set_controller( ADC_UNIT_1, ADC_CTRL_DIG );
     }
     if (adc_unit & ADC_UNIT_2) {
-        //switch SARADC into DIG channel
-        SENS.sar_read_ctrl2.sar2_dig_force = 1;
-        //1: SAR ADC2 is controlled by DIG ADC2 CTRL 0: SAR ADC2 is controlled by PWDET CTRL
-        SYSCON.saradc_ctrl.sar2_mux = 1;
+        adc_set_controller( ADC_UNIT_2, ADC_CTRL_DIG );
     }
     portEXIT_CRITICAL(&rtc_spinlock);
     adc_set_i2s_data_source(ADC_I2S_DATA_SRC_ADC);
@@ -1246,34 +1380,79 @@ esp_err_t adc1_config_width(adc_bits_width_t width_bit)
     return ESP_OK;
 }
 
-int adc1_get_raw(adc1_channel_t channel)
+static inline void adc1_fsm_disable()
 {
-    uint16_t adc_value;
-    RTC_MODULE_CHECK(channel < ADC1_CHANNEL_MAX, "ADC Channel Err", ESP_ERR_INVALID_ARG);
-
-    adc_power_on(); 
-
-    portENTER_CRITICAL(&rtc_spinlock);
-    //Adc Controler is Rtc module,not ulp coprocessor
-    SENS.sar_meas_start1.meas1_start_force = 1;
-    //Disable Amp Bit1=0:Fsm  Bit1=1(Bit0=0:PownDown Bit10=1:Powerup)
-    SENS.sar_meas_wait2.force_xpd_amp = 0x2;
-    //Open the ADC1 Data port Not ulp coprocessor
-    SENS.sar_meas_start1.sar1_en_pad_force = 1;
-    //Select channel
-    SENS.sar_meas_start1.sar1_en_pad = (1 << channel);
+    //channel is set in the  convert function
+    SENS.sar_meas_wait2.force_xpd_amp = SENS_FORCE_XPD_AMP_PD;
+    //disable FSM, it's only used by the LNA.
     SENS.sar_meas_ctrl.amp_rst_fb_fsm = 0;
     SENS.sar_meas_ctrl.amp_short_ref_fsm = 0;
     SENS.sar_meas_ctrl.amp_short_ref_gnd_fsm = 0;
     SENS.sar_meas_wait1.sar_amp_wait1 = 1;
     SENS.sar_meas_wait1.sar_amp_wait2 = 1;
-    SENS.sar_meas_wait2.sar_amp_wait3 = 1;
-    while (SENS.sar_slave_addr1.meas_status != 0);
-    SENS.sar_meas_start1.meas1_start_sar = 0;
-    SENS.sar_meas_start1.meas1_start_sar = 1;
-    while (SENS.sar_meas_start1.meas1_done_sar == 0);
-    adc_value = SENS.sar_meas_start1.meas1_data_sar;
+    SENS.sar_meas_wait2.sar_amp_wait3 = 1;    
+}
+
+esp_err_t adc1_i2s_mode_acquire()
+{
+    //lazy initialization
+    //for i2s, block until acquire the lock
+    _lock_acquire( &adc1_i2s_lock );
+    ESP_LOGD( RTC_MODULE_TAG, "i2s mode takes adc1 lock." );
+    portENTER_CRITICAL(&rtc_spinlock);
+    SENS.sar_meas_wait2.force_xpd_sar = SENS_FORCE_XPD_SAR_PU;
+    //switch SARADC into DIG channel
+    SENS.sar_read_ctrl.sar1_dig_force = 1;
     portEXIT_CRITICAL(&rtc_spinlock);
+    return ESP_OK;
+}
+
+esp_err_t adc1_adc_mode_acquire()
+{
+    //lazy initialization
+    //for adc1, block until acquire the lock
+    _lock_acquire( &adc1_i2s_lock );
+    ESP_LOGD( RTC_MODULE_TAG, "adc mode takes adc1 lock." );
+    portENTER_CRITICAL(&rtc_spinlock);
+    // for now the WiFi would use ADC2 and set xpd_sar force on.
+    // so we can not reset xpd_sar to fsm mode directly.
+    // We should handle this after the synchronization mechanism is established.
+
+    //switch SARADC into RTC channel
+    SENS.sar_read_ctrl.sar1_dig_force = 0;
+    portEXIT_CRITICAL(&rtc_spinlock);
+    return ESP_OK;
+}
+
+esp_err_t adc1_lock_release()
+{
+    RTC_MODULE_CHECK((uint32_t*)adc1_i2s_lock != NULL, "adc1 lock release called before acquire", ESP_ERR_INVALID_STATE );
+    // for now the WiFi would use ADC2 and set xpd_sar force on.
+    // so we can not reset xpd_sar to fsm mode directly.
+    // We should handle this after the synchronization mechanism is established.
+
+    _lock_release( &adc1_i2s_lock );
+    ESP_LOGD( RTC_MODULE_TAG, "returns adc1 lock." );
+    return ESP_OK;
+}
+
+int adc1_get_raw(adc1_channel_t channel)
+{
+    uint16_t adc_value;
+    RTC_MODULE_CHECK(channel < ADC1_CHANNEL_MAX, "ADC Channel Err", ESP_ERR_INVALID_ARG);
+    adc1_adc_mode_acquire();
+    adc_power_on();
+
+    portENTER_CRITICAL(&rtc_spinlock);    
+    //disable other peripherals
+    adc1_hall_enable(false);
+    adc1_fsm_disable(); //currently the LNA is not open, close it by default
+    //set controller
+    adc_set_controller( ADC_UNIT_1, ADC_CTRL_RTC );
+    //start conversion
+    adc_value = adc_convert( ADC_UNIT_1, channel );
+    portEXIT_CRITICAL(&rtc_spinlock);
+    adc1_lock_release();
     return adc_value;
 }
 
@@ -1287,15 +1466,11 @@ void adc1_ulp_enable(void)
     adc_power_on();
 
     portENTER_CRITICAL(&rtc_spinlock);
-    SENS.sar_meas_start1.meas1_start_force = 0;
-    SENS.sar_meas_start1.sar1_en_pad_force = 0;
-    SENS.sar_meas_wait2.force_xpd_amp = 0x2;
-    SENS.sar_meas_ctrl.amp_rst_fb_fsm = 0;
-    SENS.sar_meas_ctrl.amp_short_ref_fsm = 0;
-    SENS.sar_meas_ctrl.amp_short_ref_gnd_fsm = 0;
-    SENS.sar_meas_wait1.sar_amp_wait1 = 0x1;
-    SENS.sar_meas_wait1.sar_amp_wait2 = 0x1;
-    SENS.sar_meas_wait2.sar_amp_wait3 = 0x1;
+    adc_set_controller( ADC_UNIT_1, ADC_CTRL_ULP );
+    // since most users do not need LNA and HALL with uLP, we disable them here
+    // open them in the uLP if needed.
+    adc1_fsm_disable();
+    adc1_hall_enable(false);
     portEXIT_CRITICAL(&rtc_spinlock);
 }
 
@@ -1400,14 +1575,23 @@ static inline void adc2_config_width(adc_bits_width_t width_bit)
     portENTER_CRITICAL(&rtc_spinlock);
     //sar_start_force shared with ADC1
     SENS.sar_start_force.sar2_bit_width = width_bit;
+    //cct set to the same value with PHY
+    SENS.sar_start_force.sar2_pwdet_cct = 4;
     portEXIT_CRITICAL(&rtc_spinlock);
 
     //Invert the adc value,the Output value is invert
     SENS.sar_read_ctrl2.sar2_data_inv = 1;
     //Set The adc sample width,invert adc value,must digital sar2_bit_width[1:0]=3
     SENS.sar_read_ctrl2.sar2_sample_bit = width_bit;
-    //Take the control from WIFI    
-    SENS.sar_read_ctrl2.sar2_pwdet_force = 0;
+}
+
+static inline void adc2_dac_disable( adc2_channel_t channel)
+{
+    if ( channel == ADC2_CHANNEL_8 ) { // the same as DAC channel 1
+        dac_output_set_enable( DAC_CHANNEL_1, false );
+    } else if ( channel == ADC2_CHANNEL_9 ) {
+        dac_output_set_enable( DAC_CHANNEL_2, false );
+    }
 }
 
 //registers in critical section with adc1:
@@ -1428,19 +1612,18 @@ esp_err_t adc2_get_raw(adc2_channel_t channel, adc_bits_width_t width_bit, int* 
         portEXIT_CRITICAL( &adc2_spinlock );
         return ESP_ERR_TIMEOUT;
     }
-    //in critical section with whole rtc module
+
+    //disable other peripherals
+#ifdef CONFIG_ADC2_DISABLE_DAC
+    adc2_dac_disable( channel );
+#endif
+    // set controller
+    // in critical section with whole rtc module
+    // because the PWDET use the same registers, place it here.
     adc2_config_width( width_bit );
-    
-    //Adc Controler is Rtc module,not ulp coprocessor
-    SENS.sar_meas_start2.meas2_start_force = 1; //force pad mux and force start
-    //Open the ADC2 Data port Not ulp coprocessor
-    SENS.sar_meas_start2.sar2_en_pad_force = 1; //open the ADC2 data port
-    //Select channel
-    SENS.sar_meas_start2.sar2_en_pad = 1 << channel; //pad enable
-    SENS.sar_meas_start2.meas2_start_sar = 0; //start force 0
-    SENS.sar_meas_start2.meas2_start_sar = 1; //start force 1
-    while (SENS.sar_meas_start2.meas2_done_sar == 0) {}; //read done
-    adc_value = SENS.sar_meas_start2.meas2_data_sar;
+    adc_set_controller( ADC_UNIT_2, ADC_CTRL_RTC );
+    //start converting
+    adc_value = adc_convert( ADC_UNIT_2, channel );
     _lock_release( &adc2_wifi_lock );
     portEXIT_CRITICAL(&adc2_spinlock);
 
@@ -1467,6 +1650,8 @@ esp_err_t adc2_vref_to_gpio(gpio_num_t gpio)
     rtc_gpio_input_disable(gpio);
     rtc_gpio_pullup_dis(gpio);
     rtc_gpio_pulldown_dis(gpio);
+    //force fsm
+    adc_power_always_on();               //Select power source of ADC
 
     RTCCNTL.bias_conf.dbg_atten = 0;     //Check DBG effect outside sleep mode
     //set dtest (MUX_SEL : 0 -> RTC; 1-> vdd_sar2)
@@ -1475,8 +1660,6 @@ esp_err_t adc2_vref_to_gpio(gpio_num_t gpio)
     RTCCNTL.test_mux.ent_rtc = 1;
     //set sar2_en_test
     SENS.sar_start_force.sar2_en_test = 1;
-    //force fsm
-    SENS.sar_meas_wait2.force_xpd_sar = ADC_FORCE_ENABLE;    //Select power source of ADC
     //set sar2 en force
     SENS.sar_meas_start2.sar2_en_pad_force = 1;      //Pad bitmap controlled by SW
     //set en_pad for channels 7,8,9 (bits 0x380)
@@ -1521,16 +1704,18 @@ static esp_err_t dac_rtc_pad_init(dac_channel_t channel)
     return ESP_OK;
 }
 
+static inline void dac_output_set_enable(dac_channel_t channel, bool enable)
+{
+    RTCIO.pad_dac[channel-DAC_CHANNEL_1].dac_xpd_force = enable;
+    RTCIO.pad_dac[channel-DAC_CHANNEL_1].xpd_dac = enable;
+}
+
 esp_err_t dac_output_enable(dac_channel_t channel)
 {
     RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
     dac_rtc_pad_init(channel);
     portENTER_CRITICAL(&rtc_spinlock);
-    if (channel == DAC_CHANNEL_1) {
-        SET_PERI_REG_MASK(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_XPD_DAC | RTC_IO_PDAC1_DAC_XPD_FORCE);
-    } else if (channel == DAC_CHANNEL_2) {
-        SET_PERI_REG_MASK(RTC_IO_PAD_DAC2_REG, RTC_IO_PDAC2_XPD_DAC | RTC_IO_PDAC2_DAC_XPD_FORCE);
-    }
+    dac_output_set_enable(channel, true);
     portEXIT_CRITICAL(&rtc_spinlock);
 
     return ESP_OK;
@@ -1540,11 +1725,7 @@ esp_err_t dac_output_disable(dac_channel_t channel)
 {
     RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
     portENTER_CRITICAL(&rtc_spinlock);
-    if (channel == DAC_CHANNEL_1) {
-        CLEAR_PERI_REG_MASK(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_XPD_DAC | RTC_IO_PDAC1_DAC_XPD_FORCE);
-    } else if (channel == DAC_CHANNEL_2) {
-        CLEAR_PERI_REG_MASK(RTC_IO_PAD_DAC2_REG, RTC_IO_PDAC2_XPD_DAC | RTC_IO_PDAC2_DAC_XPD_FORCE);
-    }
+    dac_output_set_enable(channel, false);
     portEXIT_CRITICAL(&rtc_spinlock);
 
     return ESP_OK;
@@ -1624,6 +1805,12 @@ esp_err_t dac_i2s_disable()
 /*---------------------------------------------------------------
                         HALL SENSOR
 ---------------------------------------------------------------*/
+
+static inline void adc1_hall_enable(bool enable)
+{
+    RTCIO.hall_sens.xpd_hall = enable;        
+}
+
 static int hall_sensor_get_value()    //hall sensor without LNA
 {
     int Sens_Vp0;
@@ -1635,19 +1822,18 @@ static int hall_sensor_get_value()    //hall sensor without LNA
     adc_power_on();
 
     portENTER_CRITICAL(&rtc_spinlock);
-    SENS.sar_touch_ctrl1.xpd_hall_force = 1;     // hall sens force enable
-    RTCIO.hall_sens.xpd_hall = 1;      // xpd hall
-    SENS.sar_touch_ctrl1.hall_phase_force = 1;   // phase force
-
+    //disable other peripherals
+    adc1_fsm_disable();//currently the LNA is not open, close it by default    
+    adc1_hall_enable(true);   
+    // set controller
+    adc_set_controller( ADC_UNIT_1, ADC_CTRL_RTC );
+    // convert for 4 times with different phase and outputs
     RTCIO.hall_sens.hall_phase = 0;      // hall phase
-    Sens_Vp0 = adc1_get_raw(ADC1_CHANNEL_0);
-    Sens_Vn0 = adc1_get_raw(ADC1_CHANNEL_3);
+    Sens_Vp0 = adc_convert( ADC_UNIT_1, ADC1_CHANNEL_0 );
+    Sens_Vn0 = adc_convert( ADC_UNIT_1, ADC1_CHANNEL_3 );
     RTCIO.hall_sens.hall_phase = 1;
-    Sens_Vp1 = adc1_get_raw(ADC1_CHANNEL_0);
-    Sens_Vn1 = adc1_get_raw(ADC1_CHANNEL_3);
-
-    SENS.sar_touch_ctrl1.xpd_hall_force = 0;
-    SENS.sar_touch_ctrl1.hall_phase_force = 0;
+    Sens_Vp1 = adc_convert( ADC_UNIT_1, ADC1_CHANNEL_0 );
+    Sens_Vn1 = adc_convert( ADC_UNIT_1, ADC1_CHANNEL_3 );
     portEXIT_CRITICAL(&rtc_spinlock);
     hall_value = (Sens_Vp1 - Sens_Vp0) - (Sens_Vn1 - Sens_Vn0);
 

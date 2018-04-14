@@ -35,13 +35,13 @@
 #include "tcpip_adapter.h"
 #include "esp_log.h"
 
-const char* TAG = "event";
+static const char* TAG = "event";
 
 #define WIFI_API_CALL_CHECK(info, api_call, ret) \
 do{\
     esp_err_t __err = (api_call);\
     if ((ret) != __err) {\
-        ESP_LOGE(TAG, "%s %d %s ret=%d", __FUNCTION__, __LINE__, (info), __err);\
+        ESP_LOGE(TAG, "%s %d %s ret=0x%X", __FUNCTION__, __LINE__, (info), __err);\
         return __err;\
     }\
 } while(0)

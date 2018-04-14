@@ -62,6 +62,7 @@ queue and re-enabling the interrupt will trigger the interrupt again, which can 
 #include "esp_heap_caps.h"
 
 typedef struct spi_device_t spi_device_t;
+typedef typeof(SPI1.clock) spi_clock_reg_t;
 
 #define NO_CS 3     //Number of CS pins per SPI host
 
@@ -80,6 +81,7 @@ typedef struct {
     spi_dev_t *hw;
     spi_trans_priv cur_trans_buf;
     int cur_cs;
+    int prev_cs;
     lldesc_t *dmadesc_tx;
     lldesc_t *dmadesc_rx;
     bool no_gpio_matrix;
@@ -90,10 +92,17 @@ typedef struct {
 #endif
 } spi_host_t;
 
+typedef struct {
+    spi_clock_reg_t reg;
+    int eff_clk;
+    int dummy_num;
+} clock_config_t;
+
 struct spi_device_t {
     QueueHandle_t trans_queue;
     QueueHandle_t ret_queue;
     spi_device_interface_config_t cfg;
+    clock_config_t clk_cfg;
     spi_host_t *host;
 };
 
@@ -160,6 +169,7 @@ esp_err_t spi_bus_initialize(spi_host_device_t host, const spi_bus_config_t *bus
     spihost[host]->hw=spicommon_hw_for_host(host);
 
     spihost[host]->cur_cs = NO_CS;
+    spihost[host]->prev_cs = NO_CS;
 
     //Reset DMA
     spihost[host]->hw->dma_conf.val|=SPI_OUT_RST|SPI_IN_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST;
@@ -229,14 +239,27 @@ esp_err_t spi_bus_free(spi_host_device_t host)
     return ESP_OK;
 }
 
+static inline uint32_t spi_dummy_limit(bool gpio_is_used)
+{
+    const int apbclk=APB_CLK_FREQ;
+    if (!gpio_is_used) {
+        return apbclk;  //dummy bit workaround is not used when native pins are used
+    } else {
+        return apbclk/2;  //the dummy bit workaround is used when freq is 40MHz and GPIO matrix is used.
+    }
+}
+
 /*
  Add a device. This allocates a CS line for the device, allocates memory for the device structure and hooks
  up the CS pin to whatever is specified.
 */
-esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config_t *dev_config, spi_device_handle_t *handle)
+esp_err_t spi_bus_add_device(spi_host_device_t host, const spi_device_interface_config_t *dev_config, spi_device_handle_t *handle)
 {
     int freecs;
     int apbclk=APB_CLK_FREQ;
+    int eff_clk;
+    int duty_cycle;
+    spi_clock_reg_t clk_reg;
     SPI_CHECK(host>=SPI_HOST && host<=VSPI_HOST, "invalid host", ESP_ERR_INVALID_ARG);
     SPI_CHECK(spihost[host]!=NULL, "host not initialized", ESP_ERR_INVALID_STATE);
     SPI_CHECK(dev_config->spics_io_num < 0 || GPIO_IS_VALID_OUTPUT_GPIO(dev_config->spics_io_num), "spics pin invalid", ESP_ERR_INVALID_ARG);
@@ -249,9 +272,17 @@ esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config
     //The hardware looks like it would support this, but actually setting cs_ena_pretrans when transferring in full
     //duplex mode does absolutely nothing on the ESP32.
     SPI_CHECK(dev_config->cs_ena_pretrans==0 || (dev_config->flags & SPI_DEVICE_HALFDUPLEX), "cs pretrans delay incompatible with full-duplex", ESP_ERR_INVALID_ARG);
+    
     //Speeds >=40MHz over GPIO matrix needs a dummy cycle, but these don't work for full-duplex connections.
-    SPI_CHECK(!( ((dev_config->flags & SPI_DEVICE_HALFDUPLEX)==0) && (dev_config->clock_speed_hz > ((apbclk*2)/5)) && (!spihost[host]->no_gpio_matrix)),
-            "No speeds >26MHz supported for full-duplex, GPIO-matrix SPI transfers", ESP_ERR_INVALID_ARG);
+    duty_cycle = (dev_config->duty_cycle_pos==0? 128: dev_config->duty_cycle_pos);
+    eff_clk = spi_cal_clock(apbclk, dev_config->clock_speed_hz, duty_cycle, (uint32_t*)&clk_reg);    
+    uint32_t dummy_limit = spi_dummy_limit(!spihost[host]->no_gpio_matrix);
+    SPI_CHECK( dev_config->flags & SPI_DEVICE_HALFDUPLEX || (eff_clk/1000/1000) < (dummy_limit/1000/1000) ||
+            dev_config->flags & SPI_DEVICE_NO_DUMMY,
+"When GPIO matrix is used in full-duplex mode at frequency > 26MHz, device cannot read correct data.\n\
+Please note the SPI can only work at divisors of 80MHz, and the driver always tries to find the closest frequency to your configuration.\n\
+Specify ``SPI_DEVICE_NO_DUMMY`` to ignore this checking. Then you can output data at higher speed, or read data at your own risk.", 
+            ESP_ERR_INVALID_ARG );
 
     //Allocate memory for device
     spi_device_t *dev=malloc(sizeof(spi_device_t));
@@ -262,12 +293,18 @@ esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config
     //Allocate queues, set defaults
     dev->trans_queue=xQueueCreate(dev_config->queue_size, sizeof(spi_trans_priv));
     dev->ret_queue=xQueueCreate(dev_config->queue_size, sizeof(spi_trans_priv));
-    if (!dev->trans_queue || !dev->ret_queue) goto nomem;
-    if (dev_config->duty_cycle_pos==0) dev_config->duty_cycle_pos=128;
+    if (!dev->trans_queue || !dev->ret_queue) goto nomem;    
     dev->host=spihost[host];
 
     //We want to save a copy of the dev config in the dev struct.
     memcpy(&dev->cfg, dev_config, sizeof(spi_device_interface_config_t));
+    dev->cfg.duty_cycle_pos = duty_cycle;
+    // TODO: if we have to change the apb clock among transactions, re-calculate this each time the apb clock lock is acquired.    
+    dev->clk_cfg= (clock_config_t) {
+        .eff_clk = eff_clk,
+        .dummy_num = (dev->clk_cfg.eff_clk >= dummy_limit? 1: 0),
+        .reg = clk_reg,
+    };
 
     //Set CS pin, CS options
     if (dev_config->spics_io_num >= 0) {
@@ -285,6 +322,7 @@ esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config
         spihost[host]->hw->pin.master_cs_pol &= (1<<freecs);
     }
     *handle=dev;
+    ESP_LOGD(SPI_TAG, "SPI%d: New device added to CS%d, effective clock: %dkHz", host, freecs, dev->clk_cfg.eff_clk/1000);
     return ESP_OK;
 
 nomem:
@@ -311,7 +349,10 @@ esp_err_t spi_bus_remove_device(spi_device_handle_t handle)
     vQueueDelete(handle->ret_queue);
     //Remove device from list of csses and free memory
     for (x=0; x<NO_CS; x++) {
-        if (handle->host->device[x] == handle) handle->host->device[x]=NULL;
+        if (handle->host->device[x] == handle){
+            handle->host->device[x]=NULL;
+            if ( x == handle->host->prev_cs ) handle->host->prev_cs = NO_CS;
+        }
     }
     free(handle);
     return ESP_OK;
@@ -321,21 +362,19 @@ static int spi_freq_for_pre_n(int fapb, int pre, int n) {
     return (fapb / (pre * n));
 }
 
-/*
- * Set the SPI clock to a certain frequency. Returns the effective frequency set, which may be slightly
- * different from the requested frequency.
- */
-static int spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
-    int pre, n, h, l, eff_clk;
+int spi_cal_clock(int fapb, int hz, int duty_cycle, uint32_t *reg_o)
+{
+    spi_clock_reg_t reg;
+    int eff_clk;
 
     //In hw, n, h and l are 1-64, pre is 1-8K. Value written to register is one lower than used value.
     if (hz>((fapb/4)*3)) {
         //Using Fapb directly will give us the best result here.
-        hw->clock.clkcnt_l=0;
-        hw->clock.clkcnt_h=0;
-        hw->clock.clkcnt_n=0;
-        hw->clock.clkdiv_pre=0;
-        hw->clock.clk_equ_sysclk=1;
+        reg.clkcnt_l=0;
+        reg.clkcnt_h=0;
+        reg.clkcnt_n=0;
+        reg.clkdiv_pre=0;
+        reg.clk_equ_sysclk=1;
         eff_clk=fapb;
     } else {
         //For best duty cycle resolution, we want n to be as close to 32 as possible, but
@@ -343,6 +382,7 @@ static int spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
         //To do this, we bruteforce n and calculate the best pre to go along with that.
         //If there's a choice between pre/n combos that give the same result, use the one
         //with the higher n.
+        int pre, n, h, l;
         int bestn=-1;
         int bestpre=-1;
         int besterr=0;
@@ -367,16 +407,23 @@ static int spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
         h=(duty_cycle*n+127)/256;
         if (h<=0) h=1;
 
-        hw->clock.clk_equ_sysclk=0;
-        hw->clock.clkcnt_n=n-1;
-        hw->clock.clkdiv_pre=pre-1;
-        hw->clock.clkcnt_h=h-1;
-        hw->clock.clkcnt_l=l-1;
+        reg.clk_equ_sysclk=0;
+        reg.clkcnt_n=n-1;
+        reg.clkdiv_pre=pre-1;
+        reg.clkcnt_h=h-1;
+        reg.clkcnt_l=l-1;
         eff_clk=spi_freq_for_pre_n(fapb, pre, n);
     }
+    if ( reg_o != NULL ) *reg_o = reg.val;
     return eff_clk;
 }
 
+/*
+ * Set the spi clock according to pre-calculated register value.
+ */
+static inline void spi_set_clock(spi_dev_t *hw, spi_clock_reg_t reg) {
+    hw->clock.val = reg.val;
+}
 
 //This is run in interrupt context and apart from initialization and destruction, this is the only code
 //touching the host (=spihost[x]) variable. The rest of the data arrives in queues. That is why there are
@@ -384,7 +431,6 @@ static int spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
 static void IRAM_ATTR spi_intr(void *arg)
 {
     int i;
-    int prevCs=-1;
     BaseType_t r;
     BaseType_t do_yield=pdFALSE;
     spi_trans_priv *trans_buf=NULL;
@@ -412,7 +458,6 @@ static void IRAM_ATTR spi_intr(void *arg)
         if (host->device[host->cur_cs]->cfg.post_cb) host->device[host->cur_cs]->cfg.post_cb(cur_trans);
         //Return transaction descriptor.
         xQueueSendFromISR(host->device[host->cur_cs]->ret_queue, &host->cur_trans_buf, &do_yield); 
-        prevCs=host->cur_cs;
         host->cur_cs = NO_CS;
     }
     //Tell common code DMA workaround that our DMA channel is idle. If needed, the code will do a DMA reset.
@@ -445,11 +490,10 @@ static void IRAM_ATTR spi_intr(void *arg)
         assert(host->hw->cmd.usr == 0);
         
         //Reconfigure according to device settings, but only if we change CSses.
-        if (i!=prevCs) {
-            //Assumes a hardcoded 80MHz Fapb for now. ToDo: figure out something better once we have
-            //clock scaling working.
-            int apbclk=APB_CLK_FREQ;
-            int effclk=spi_set_clock(host->hw, apbclk, dev->cfg.clock_speed_hz, dev->cfg.duty_cycle_pos);
+        if (i!=host->prev_cs) {
+            const int apbclk=APB_CLK_FREQ;
+            int effclk=dev->clk_cfg.eff_clk;
+            spi_set_clock(host->hw, dev->clk_cfg.reg);
             //Configure bit order
             host->hw->ctrl.rd_bit_order=(dev->cfg.flags & SPI_DEVICE_RXBIT_LSBFIRST)?1:0;
             host->hw->ctrl.wr_bit_order=(dev->cfg.flags & SPI_DEVICE_TXBIT_LSBFIRST)?1:0;
@@ -457,16 +501,13 @@ static void IRAM_ATTR spi_intr(void *arg)
             //Configure polarity
             //SPI iface needs to be configured for a delay in some cases.
             int nodelay=0;
-            int extra_dummy=0;
             if (host->no_gpio_matrix) {
                 if (effclk >= apbclk/2) {
                     nodelay=1;
                 }
             } else {
-                if (effclk >= apbclk/2) {
-                    nodelay=1;
-                    extra_dummy=1;          //Note: This only works on half-duplex connections. spi_bus_add_device checks for this.
-                } else if (effclk >= apbclk/4) {
+                uint32_t delay_limit = apbclk/4;
+                if (effclk >= delay_limit) {
                     nodelay=1;
                 }
             }
@@ -488,10 +529,6 @@ static void IRAM_ATTR spi_intr(void *arg)
                 host->hw->user.ck_out_edge=0;
                 host->hw->ctrl2.miso_delay_mode=nodelay?0:2;
             }
-
-            //configure dummy bits
-            host->hw->user.usr_dummy=(dev->cfg.dummy_bits+extra_dummy)?1:0;
-            host->hw->user1.usr_dummy_cyclelen=dev->cfg.dummy_bits+extra_dummy-1;
             //Configure misc stuff
             host->hw->user.doutdin=(dev->cfg.flags & SPI_DEVICE_HALFDUPLEX)?0:1;
             host->hw->user.sio=(dev->cfg.flags & SPI_DEVICE_3WIRE)?1:0;
@@ -506,6 +543,7 @@ static void IRAM_ATTR spi_intr(void *arg)
             host->hw->pin.cs1_dis=(i==1)?0:1;
             host->hw->pin.cs2_dis=(i==2)?0:1;
         }
+        host->prev_cs = i;
         //Reset SPI peripheral
         host->hw->dma_conf.val |= SPI_OUT_RST|SPI_IN_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST;
         host->hw->dma_out_link.start=0;
@@ -535,8 +573,8 @@ static void IRAM_ATTR spi_intr(void *arg)
             host->hw->ctrl.fastrd_mode=1;
         }
 
-
         //Fill DMA descriptors
+        int extra_dummy=0;
         if (trans_buf->buffer_to_rcv) {
             host->hw->user.usr_miso_highpart=0;
             if (host->dma_chan == 0) {
@@ -546,6 +584,10 @@ static void IRAM_ATTR spi_intr(void *arg)
                 spicommon_setup_dma_desc_links(host->dmadesc_rx, ((trans->rxlength+7)/8), (uint8_t*)trans_buf->buffer_to_rcv, true);
                 host->hw->dma_in_link.addr=(int)(&host->dmadesc_rx[0]) & 0xFFFFF;
                 host->hw->dma_in_link.start=1;
+            }
+            //when no_dummy is not set and in half-duplex mode, sets the dummy bit if RX phase exist
+            if (((dev->cfg.flags&SPI_DEVICE_NO_DUMMY)==0) && (dev->cfg.flags&SPI_DEVICE_HALFDUPLEX)) {
+                extra_dummy=dev->clk_cfg.dummy_num;
             }
         } else {
             //DMA temporary workaround: let RX DMA work somehow to avoid the issue in ESP32 v0/v1 silicon 
@@ -574,6 +616,10 @@ static void IRAM_ATTR spi_intr(void *arg)
                 host->hw->user.usr_mosi_highpart=0;
             }
         }
+
+        //configure dummy bits
+        host->hw->user.usr_dummy=(dev->cfg.dummy_bits+extra_dummy)?1:0;
+        host->hw->user1.usr_dummy_cyclelen=dev->cfg.dummy_bits+extra_dummy-1;
 
         host->hw->mosi_dlen.usr_mosi_dbitlen=trans->length-1;
         if ( dev->cfg.flags & SPI_DEVICE_HALFDUPLEX ) {
@@ -641,7 +687,6 @@ esp_err_t spi_device_queue_trans(spi_device_handle_t handle, spi_transaction_t *
     SPI_CHECK(!((trans_desc->flags & (SPI_TRANS_MODE_DIO|SPI_TRANS_MODE_QIO)) && (!(handle->cfg.flags & SPI_DEVICE_HALFDUPLEX))), "incompatible iface params", ESP_ERR_INVALID_ARG);
     SPI_CHECK( !(handle->cfg.flags & SPI_DEVICE_HALFDUPLEX) || handle->host->dma_chan == 0 || !(trans_desc->flags & SPI_TRANS_USE_RXDATA || trans_desc->rx_buffer != NULL)
         || !(trans_desc->flags & SPI_TRANS_USE_TXDATA || trans_desc->tx_buffer!=NULL), "SPI half duplex mode does not support using DMA with both MOSI and MISO phases.", ESP_ERR_INVALID_ARG );
-
     //In Full duplex mode, default rxlength to be the same as length, if not filled in.
     // set rxlength to length is ok, even when rx buffer=NULL
     if (trans_desc->rxlength==0 && !(handle->cfg.flags & SPI_DEVICE_HALFDUPLEX)) {

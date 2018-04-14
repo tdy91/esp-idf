@@ -118,13 +118,20 @@ void btu_free_core(void)
     // Free the mandatory core stack components
     l2c_free();
 
+#if (defined(SDP_INCLUDED) && SDP_INCLUDED == TRUE)
+    sdp_deinit();
+#endif
+
 #if BLE_INCLUDED == TRUE
-#if (defined(GATTS_INCLUDED) && GATTS_INCLUDED == true)
+#if (defined(GATT_INCLUDED) && GATT_INCLUDED == true)
     gatt_free();
 #endif
     btm_ble_free();
 #endif
     btm_free();
+#if SMP_INCLUDED == TRUE
+    SMP_Free();
+#endif
 }
 
 /*****************************************************************************
@@ -141,6 +148,9 @@ void btu_free_core(void)
 ******************************************************************************/
 void BTU_StartUp(void)
 {
+#if BTU_DYNAMIC_MEMORY
+    btu_cb_ptr = (tBTU_CB *)osi_malloc(sizeof(tBTU_CB));
+#endif /* #if BTU_DYNAMIC_MEMORY */
     memset (&btu_cb, 0, sizeof (tBTU_CB));
     btu_cb.trace_level = HCI_INITIAL_TRACE_LEVEL;
 
@@ -182,6 +192,9 @@ error_exit:;
 
 void BTU_ShutDown(void)
 {
+#if BTU_DYNAMIC_MEMORY
+    FREE_AND_RESET(btu_cb_ptr);
+#endif
     btu_task_shut_down();
 
     hash_map_free(btu_general_alarm_hash_map);
